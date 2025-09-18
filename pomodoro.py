@@ -5,6 +5,7 @@ import sys
 import shutil
 import os
 import platform
+import atexit
 
 # Default durations (minutes)
 DEFAULT_WORK_MIN = 25
@@ -28,28 +29,36 @@ signal.signal(signal.SIGINT, signal_handler)
 if hasattr(signal, 'SIGTERM'):
     signal.signal(signal.SIGTERM, signal_handler)
 
-def countdown(total_seconds: int, phase: str, cycle: int, use_ascii: bool, tick: float, use_color: bool):
+def countdown(total_seconds: int, phase: str, cycle: int, use_ascii: bool, tick: float, use_color: bool, notifier: 'Notifier|None'=None, pre_rest:int=30):
     global _prev_line_len
     start = time.time()
     remain = total_seconds
+    if notifier:
+        if phase == '工作':
+            notifier.notify('番茄钟', f'开始工作：第{cycle}轮', duration=5)
+        else:
+            notifier.notify('番茄钟', f'开始休息：第{cycle}轮', duration=5)
     full_block = '#' if use_ascii else '█'
     empty_block = '-' if use_ascii else '░'
-    if total_seconds <= 2:  # extremely short: no dynamic bar loop
+    if total_seconds <= 2:
         time_label = f"{remain//60:02d}:{remain%60:02d}"
         msg = f"第{cycle}轮 {phase} {time_label} 开始" if remain > 0 else f"第{cycle}轮 {phase} 结束"
         print(msg)
         time.sleep(total_seconds)
         return
     last_render_second = -1
+    pre_notice_sent = False
     while remain > 0 and RUNNING:
         now = time.time()
         elapsed = now - start
         remain = max(0, total_seconds - elapsed)
-        # Only update on tick boundaries (or final)
+        if phase == '休息' and notifier and (not pre_notice_sent) and remain <= pre_rest:
+            notifier.notify('番茄钟', f'休息即将结束(剩余~{int(remain)}s)，准备工作', duration=5)
+            pre_notice_sent = True
         if (tick <= 0.05) or (elapsed // tick) != (last_render_second // tick) or remain <= 0:
             last_render_second = elapsed
             term_width = shutil.get_terminal_size(fallback=(80, 20)).columns
-            whole_seconds_left = int(remain + 0.999)  # ceiling to show user
+            whole_seconds_left = int(remain + 0.999)
             mins = whole_seconds_left // 60
             secs = whole_seconds_left % 60
             progress = min(1.0, max(0.0, elapsed / total_seconds)) if total_seconds > 0 else 1.0
@@ -60,7 +69,7 @@ def countdown(total_seconds: int, phase: str, cycle: int, use_ascii: bool, tick:
                 else:
                     prefix_phase = f"{COLOR_PHASE_REST}{phase}{COLOR_RESET}"
             prefix = f"第{cycle}轮 {prefix_phase} | 剩余 {mins:02d}:{secs:02d} | "
-            percent = f"{progress*100:5.1f}%"  # always width 7 incl %
+            percent = f"{progress*100:5.1f}%"
             suffix = ' ' + percent
             available_for_bar = term_width - len(prefix) - len(suffix) - 1
             if available_for_bar < 5:
@@ -82,31 +91,34 @@ def countdown(total_seconds: int, phase: str, cycle: int, use_ascii: bool, tick:
             _prev_line_len = len(msg)
         if remain <= 0 or not RUNNING:
             break
-        # precise sleep to next tick
         to_next = tick - ((time.time() - start) % tick)
         if to_next < 0.01:
             to_next = 0.01
         time.sleep(min(to_next, remain))
-    # Final clear & end message
     print('\r' + ' ' * _prev_line_len + '\r', end='', flush=True)
     if RUNNING:
         end_msg = (
             f"第{cycle}轮 工作完成！去休息吧！" if phase == '工作' else f"第{cycle}轮 休息结束！回来继续！"
         )
+        if notifier:
+            if phase == '工作':
+                notifier.notify('番茄钟', f'工作完成，开始休息：第{cycle}轮', duration=5)
+            else:
+                notifier.notify('番茄钟', f'休息结束，开始工作：第{cycle}轮', duration=5)
         if use_color:
             color = COLOR_PHASE_WORK if phase == '工作' else COLOR_PHASE_REST
             end_msg = f"{color}{end_msg}{COLOR_RESET}"
         print(end_msg)
 
 
-def run_pomodoro(work_min: float, rest_min: float, use_ascii: bool, tick: float, use_color: bool):
+def run_pomodoro(work_min: float, rest_min: float, use_ascii: bool, tick: float, use_color: bool, notifier: 'Notifier|None', pre_rest:int):
     cycle = 1
     try:
         while RUNNING:
-            countdown(int(work_min * 60), '工作', cycle, use_ascii, tick, use_color)
+            countdown(int(work_min * 60), '工作', cycle, use_ascii, tick, use_color, notifier, pre_rest)
             if not RUNNING:
                 break
-            countdown(int(rest_min * 60), '休息', cycle, use_ascii, tick, use_color)
+            countdown(int(rest_min * 60), '休息', cycle, use_ascii, tick, use_color, notifier, pre_rest)
             cycle += 1
     finally:
         print("已退出番茄钟。")
@@ -121,6 +133,8 @@ def parse_args():
     p.add_argument('--ascii', action='store_true', help='使用 ASCII 进度条 (避免某些终端宽度问题)')
     p.add_argument('--tick', type=float, default=1.0, help='刷新间隔秒(默认1.0, 可小于1获得更平滑显示)')
     p.add_argument('--color', action='store_true', help='启用彩色进度与阶段文本 (ANSI)')
+    p.add_argument('--notify', action='store_true', help='Windows 通知: 阶段切换提醒 (需要 win10toast)')
+    p.add_argument('--pre-rest', type=int, default=30, help='休息结束前多少秒提前提醒 (默认30)')
     return p.parse_args()
 
 
@@ -143,6 +157,62 @@ def enable_windows_ansi():
         except Exception:
             pass
 
+try:
+    from typing import Optional
+except ImportError:
+    Optional = None  # type: ignore
+
+class Notifier:
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+        self._toaster = None
+        self._fallback_ps = platform.system() == 'Windows'
+        self._failed = False
+        if enabled and platform.system() == 'Windows':
+            try:
+                from win10toast import ToastNotifier  # type: ignore
+                self._toaster = ToastNotifier()
+            except Exception:
+                self._toaster = None
+        atexit.register(self._graceful_close)
+
+    def _graceful_close(self):
+        # Short sleep to allow threaded notifications to finish
+        if self.enabled and self._toaster is not None and not self._failed:
+            try:
+                time.sleep(0.15)
+            except Exception:
+                pass
+
+    def notify(self, title: str, msg: str, duration: int = 5):
+        if not self.enabled or self._failed:
+            return
+        if self._toaster is not None:
+            try:
+                self._toaster.show_toast(title, msg, duration=duration, threaded=False)
+                return
+            except Exception as e:
+                if 'WNDPROC' in repr(e) or 'LRESULT' in repr(e) or 'WPARAM' in repr(e):
+                    self._failed = True
+                self._toaster = None
+        # PowerShell BurntToast
+        if self._fallback_ps and not self._failed:
+            try:
+                safe_title = title.replace("'", "’’")
+                safe_msg = msg.replace("'", "’’")
+                ps_script = (
+                    f"if (Get-Module -ListAvailable -Name BurntToast) "
+                    f"{{ New-BurntToastNotification -Text '{safe_title}', '{safe_msg}'; }}"
+                )
+                os.system(f"powershell -NoProfile -ExecutionPolicy Bypass \"{ps_script}\" > NUL 2>&1")
+                return
+            except Exception:
+                pass
+        try:
+            print(f"\n[通知] {title}: {msg}")
+        except Exception:
+            self._failed = True
+
 
 def main():
     args = parse_args()
@@ -152,24 +222,25 @@ def main():
         print('工作或休息时长必须为正数。')
         sys.exit(1)
     tick = max(0.05, args.tick)
+    notifier = Notifier(args.notify)
     if args.no_loop:
-        countdown(int(args.work * 60), '工作', 1, args.ascii, tick, args.color)
+        countdown(int(args.work * 60), '工作', 1, args.ascii, tick, args.color, notifier, args.pre_rest)
         if RUNNING:
             if args.beep:
                 beep()
-            countdown(int(args.rest * 60), '休息', 1, args.ascii, tick, args.color)
+            countdown(int(args.rest * 60), '休息', 1, args.ascii, tick, args.color, notifier, args.pre_rest)
             if args.beep:
                 beep()
         print('单轮完成。')
     else:
         cycle = 1
         while RUNNING:
-            countdown(int(args.work * 60), '工作', cycle, args.ascii, tick, args.color)
+            countdown(int(args.work * 60), '工作', cycle, args.ascii, tick, args.color, notifier, args.pre_rest)
             if RUNNING and args.beep:
                 beep()
             if not RUNNING:
                 break
-            countdown(int(args.rest * 60), '休息', cycle, args.ascii, tick, args.color)
+            countdown(int(args.rest * 60), '休息', cycle, args.ascii, tick, args.color, notifier, args.pre_rest)
             if RUNNING and args.beep:
                 beep()
             cycle += 1
