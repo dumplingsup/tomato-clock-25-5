@@ -1,25 +1,3 @@
-#!/usr/bin/env python3
-"""
-Legacy entry point for Pomodoro overlay GUI.
-
-This file maintains backward compatibility while using the new modular structure.
-For new projects, prefer importing from tomato_clock package directly.
-"""
-
-import sys
-import os
-
-# Add the current directory to Python path to allow imports
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-# Try to use new modular structure first
-try:
-    from tomato_clock.overlay_ui import main as new_main
-    USING_NEW_STRUCTURE = True
-except ImportError:
-    USING_NEW_STRUCTURE = False
-
-# Fallback to legacy implementation
 import time
 import threading
 import argparse
@@ -338,14 +316,6 @@ def parse_args():
 
 
 def main():
-    if USING_NEW_STRUCTURE:
-        try:
-            new_main()
-            return
-        except Exception as e:
-            print(f"新模块结构运行失败，回退到原版本: {e}")
-    
-    # Legacy implementation continues...
     args = parse_args()
     notifier = Notifier(args.notify, args.balloon)
     overlay = PomodoroOverlay(args.work, args.rest, args.alpha, args.scale, args.rounds, notifier, args.pre_rest)
